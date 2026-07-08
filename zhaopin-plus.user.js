@@ -911,71 +911,88 @@
 
     async run() {
       const config = getConfig();
-
-      // 等待职位列表加载
-      let waitCount = 0;
-      while (this.isRunning && getJobCards().length === 0 && waitCount < 10) {
-        this.logger.log('等待职位列表加载...', 'info');
-        await this.wait(1000);
-        waitCount++;
-      }
+      const processedJobs = new Set();
 
       while (this.isRunning) {
-        const cards = getJobCards();
-        if (this.currentIndex >= cards.length) {
+        let cards = getJobCards();
+        
+        if (cards.length === 0) {
+          this.logger.log('等待职位列表加载...', 'info');
+          await this.wait(1000);
+          continue;
+        }
+
+        let foundJob = false;
+        for (let i = 0; i < cards.length && this.isRunning; i++) {
+          const card = cards[i];
+          const info = getJobCardInfo(card);
+
+          if (!info.company) continue;
+          
+          if (info.jobId && processedJobs.has(info.jobId)) {
+            continue;
+          }
+
+          if (config.skipBlacklist && isBlacklisted(info.company)) {
+            this.logger.log(`跳过黑名单公司: ${info.company}`, 'warning');
+            if (info.jobId) processedJobs.add(info.jobId);
+            continue;
+          }
+
+          if (config.skipHeadHunter && isHeadHunter(info.company)) {
+            this.logger.log(`跳过猎头公司: ${info.company}`, 'warning');
+            if (info.jobId) processedJobs.add(info.jobId);
+            continue;
+          }
+
+          if (config.skipUrgent && isUrgentJob(info.title)) {
+            this.logger.log(`跳过急聘岗位: ${info.title}`, 'warning');
+            if (info.jobId) processedJobs.add(info.jobId);
+            continue;
+          }
+
+          if (!isSalaryMatch(info.salary, config.salaryRange)) {
+            this.logger.log(`薪资不匹配跳过: ${info.title} - ${info.salary}`, 'warning');
+            if (info.jobId) processedJobs.add(info.jobId);
+            continue;
+          }
+
+          if (this.totalApplied >= config.applyLimit) {
+            this.logger.log('已达到投递上限', 'info');
+            return;
+          }
+
+          foundJob = true;
+          if (info.jobId) processedJobs.add(info.jobId);
+
+          try {
+            await this.handleJob(info, config);
+          } catch (e) {
+            this.logger.log(`处理失败: ${info.title} - ${e.message}`, 'error');
+          }
+
+          const interval = this.getRandomInterval(config.applyInterval);
+          await this.wait(interval * 1000);
+          
+          cards = getJobCards();
+          break;
+        }
+
+        if (!foundJob && this.isRunning && this.totalApplied < config.applyLimit) {
           this.logger.log('已到达当前页末尾', 'info');
           const nextBtn = document.querySelector('.next-page') ||
                          findBtnByText(document, 'a', '下一页') ||
                          document.querySelector('[class*="next"]');
-          if (nextBtn && this.totalApplied < config.applyLimit) {
+          if (nextBtn) {
             this.logger.log('正在翻页...', 'info');
             nextBtn.click();
             await this.wait(3000);
-            this.currentIndex = 0;
-            continue;
+            processedJobs.clear();
+          } else {
+            this.logger.log('没有更多页面', 'info');
+            return;
           }
-          break;
         }
-
-        const card = cards[this.currentIndex];
-        const info = getJobCardInfo(card);
-        this.currentIndex++;
-
-        if (!info.company) continue;
-
-        if (config.skipBlacklist && isBlacklisted(info.company)) {
-          this.logger.log(`跳过黑名单公司: ${info.company}`, 'warning');
-          continue;
-        }
-
-        if (config.skipHeadHunter && isHeadHunter(info.company)) {
-          this.logger.log(`跳过猎头公司: ${info.company}`, 'warning');
-          continue;
-        }
-
-        if (config.skipUrgent && isUrgentJob(info.title)) {
-          this.logger.log(`跳过急聘岗位: ${info.title}`, 'warning');
-          continue;
-        }
-
-        if (!isSalaryMatch(info.salary, config.salaryRange)) {
-          this.logger.log(`薪资不匹配跳过: ${info.title} - ${info.salary}`, 'warning');
-          continue;
-        }
-
-        if (this.totalApplied >= config.applyLimit) {
-          this.logger.log('已达到投递上限', 'info');
-          break;
-        }
-
-        try {
-          await this.handleJob(info, config);
-        } catch (e) {
-          this.logger.log(`处理失败: ${info.title} - ${e.message}`, 'error');
-        }
-
-        const interval = this.getRandomInterval(config.applyInterval);
-        await this.wait(interval * 1000);
       }
     }
 
@@ -1184,6 +1201,10 @@
     
     get element() {
       return this.el;
+    }
+    
+    getValues() {
+      return this.value;
     }
   }
 
@@ -1763,8 +1784,8 @@
       });
       
       this.settings.forEach(setting => {
-        const el = this.createSettingElement(setting);
-        settingElements[setting.id] = el;
+        const result = this.createSettingElement(setting);
+        settingElements[setting.id] = result;
       });
       
       const renderSection = (sectionId) => {
@@ -1774,8 +1795,9 @@
         panelDesc.textContent = section.description;
         
         this.settings.filter(s => s.group === sectionId).forEach(setting => {
-          const el = settingElements[setting.id];
-          if (el) {
+          const result = settingElements[setting.id];
+          if (result) {
+            const el = result.container || result;
             content.appendChild(el);
           }
         });
@@ -1813,7 +1835,9 @@
         
         this.settings.forEach(setting => {
           if (settingElements[setting.id]) {
-            newConfig[setting.id] = settingElements[setting.id].getValues();
+            const result = settingElements[setting.id];
+            const control = result.control || result;
+            newConfig[setting.id] = control.getValues ? control.getValues() : control;
           }
         });
         
@@ -1898,7 +1922,7 @@
       container.appendChild(desc);
       container.appendChild(content);
       
-      return container;
+      return { container, control };
     }
     
     createNumberInput(setting) {

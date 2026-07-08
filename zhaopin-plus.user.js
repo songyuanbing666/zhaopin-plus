@@ -446,6 +446,20 @@
             </svg>
           </button>
         </div>
+        <div class="settings-bar">
+          <div class="settings-item">
+            <span class="settings-label">投递间隔</span>
+            <span class="settings-value">--</span>
+          </div>
+          <div class="settings-item">
+            <span class="settings-label">投递上限</span>
+            <span class="settings-value">--</span>
+          </div>
+          <div class="settings-item">
+            <span class="settings-label">当前状态</span>
+            <span class="settings-value status-stopped">已停止</span>
+          </div>
+        </div>
         <div class="body">
           <div class="empty">${this.options.emptyText}</div>
         </div>
@@ -454,8 +468,27 @@
       this.body = this.el.querySelector('.body');
       this.dot = this.el.querySelector('.dot');
       this.titleEl = this.el.querySelector('.title');
+      this.settingsBar = this.el.querySelector('.settings-bar');
       this.el.querySelector('.close').onclick = () => this.hide();
       document.body.appendChild(this.el);
+    }
+
+    updateSettings(config) {
+      if (!this.settingsBar) return;
+      const intervalEl = this.settingsBar.querySelector('.settings-item:nth-child(1) .settings-value');
+      const limitEl = this.settingsBar.querySelector('.settings-item:nth-child(2) .settings-value');
+      const statusEl = this.settingsBar.querySelector('.settings-item:nth-child(3) .settings-value');
+      
+      if (intervalEl) {
+        intervalEl.textContent = `${config.applyInterval.min}-${config.applyInterval.max}秒`;
+      }
+      if (limitEl) {
+        limitEl.textContent = `${config.applyLimit}个`;
+      }
+      if (statusEl) {
+        statusEl.textContent = this.dot.classList.contains('stopped') ? '已停止' : '运行中';
+        statusEl.className = `settings-value ${this.dot.classList.contains('stopped') ? 'status-stopped' : 'status-running'}`;
+      }
     }
 
     log(message, type = 'info') {
@@ -495,6 +528,13 @@
 
     setActive(active) {
       active ? this.dot.classList.remove('stopped') : this.dot.classList.add('stopped');
+      if (this.settingsBar) {
+        const statusEl = this.settingsBar.querySelector('.settings-item:nth-child(3) .settings-value');
+        if (statusEl) {
+          statusEl.textContent = active ? '运行中' : '已停止';
+          statusEl.className = `settings-value ${active ? 'status-running' : 'status-stopped'}`;
+        }
+      }
     }
 
     appendToTitle(el) {
@@ -537,6 +577,40 @@
   background: #f8fafc;
   border-radius: 12px 12px 0 0;
   border-bottom: 1px solid #e5e7eb;
+}
+
+.zp-logger .settings-bar {
+  display: flex;
+  justify-content: space-around;
+  padding: 8px 12px;
+  background: #fffbe6;
+  border-bottom: 1px solid #ffe58f;
+}
+
+.zp-logger .settings-item {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+}
+
+.zp-logger .settings-label {
+  font-size: 11px;
+  color: #9ca3af;
+}
+
+.zp-logger .settings-value {
+  font-size: 12px;
+  font-weight: 600;
+  color: #4b5563;
+}
+
+.zp-logger .settings-value.status-running {
+  color: #52c41a;
+}
+
+.zp-logger .settings-value.status-stopped {
+  color: #9ca3af;
 }
 
 .zp-logger .title {
@@ -689,6 +763,7 @@
     skipBlacklist: true,
     skipHeadHunter: true,
     skipUrgent: false,
+    skipAgentRecruit: false,
     blacklist: [],
     keywords: [],
     keywordMode: 'blacklist',
@@ -862,6 +937,8 @@
                     card.querySelector('.job-salary') ||
                     card.querySelector('[class*="salary"]');
     const titleEl = jobLink || card.querySelector('.job-title') || card.querySelector('.position-title');
+    const tagsEl = card.querySelectorAll('[class*="tag"], [class*="label"], [class*="badge"], .jobinfo__tag, .job-tag, .tag-item');
+    const tags = Array.from(tagsEl).map(el => el.textContent.trim()).filter(t => t);
 
     return {
       title: titleEl?.textContent?.trim() || '',
@@ -870,8 +947,15 @@
       applyBtn,
       favoriteBtn,
       card,
+      tags,
       jobId: jobLink?.href?.match(/\/([^/]+)\.htm$/)?.[1] || ''
     };
+  };
+  
+  const isAgentRecruit = (info) => {
+    if (!info || !info.tags) return false;
+    const agentKeywords = ['代招', '代理招聘', '外包', '外派', '派遣', '猎聘'];
+    return info.tags.some(tag => agentKeywords.some(keyword => tag.includes(keyword)));
   };
 
   class AutoApply {
@@ -880,6 +964,39 @@
       this.currentIndex = 0;
       this.totalApplied = 0;
       this.logger = new Logger({ title: '自动投递日志' });
+      this.listPageUrl = '';
+      this.processedJobs = new Set();
+      this.stateKey = 'zp_autoapply_state';
+    }
+    
+    saveState() {
+      const state = {
+        isRunning: this.isRunning,
+        totalApplied: this.totalApplied,
+        listPageUrl: this.listPageUrl,
+        processedJobs: Array.from(this.processedJobs),
+        timestamp: Date.now()
+      };
+      storage.set(this.stateKey, state);
+    }
+    
+    loadState() {
+      const state = storage.get(this.stateKey);
+      if (state && state.isRunning) {
+        const elapsed = Date.now() - state.timestamp;
+        if (elapsed < 30 * 60 * 1000) {
+          this.totalApplied = state.totalApplied || 0;
+          this.listPageUrl = state.listPageUrl || '';
+          this.processedJobs = new Set(state.processedJobs || []);
+          return true;
+        }
+      }
+      this.clearState();
+      return false;
+    }
+    
+    clearState() {
+      storage.remove(this.stateKey);
     }
 
     async start(options = {}) {
@@ -890,15 +1007,39 @@
 
       this.isRunning = true;
       this.currentIndex = 0;
-      this.totalApplied = 0;
       this.options = options;
       this.logger.show();
       this.logger.setActive(true);
+      
+      const config = getConfig();
+      this.logger.updateSettings(config);
+      
+      const hasPrevState = this.loadState();
+      if (hasPrevState && options?.resume !== false) {
+        this.logger.log(`恢复上次投递状态，已投递 ${this.totalApplied} 个`, 'info');
+      } else {
+        this.totalApplied = 0;
+        this.processedJobs = new Set();
+      }
+      
+      if (isJobListPage()) {
+        this.listPageUrl = location.href;
+        this.logger.log(`自动投递已启动，列表页: ${location.href}`, 'info');
+      } else {
+        if (!this.listPageUrl) {
+          this.listPageUrl = DEFAULT_LIST_PAGE;
+        }
+        this.logger.log(`当前不在列表页，将返回: ${this.listPageUrl}`, 'warning');
+      }
+      this.logger.log(`投递间隔: ${config.applyInterval.min}-${config.applyInterval.max}秒，投递上限: ${config.applyLimit}个`, 'info');
+      
+      this.saveState();
 
       try {
         await this.run();
       } finally {
         this.isRunning = false;
+        this.clearState();
         this.logger.setActive(false);
         toast.success(`自动投递完成，共投递 ${this.totalApplied} 个职位`);
       }
@@ -906,19 +1047,29 @@
 
     stop() {
       this.isRunning = false;
+      this.clearState();
       toast.info('自动投递已停止');
     }
 
     async run() {
       const config = getConfig();
-      const processedJobs = new Set();
 
       while (this.isRunning) {
+        if (!isJobListPage()) {
+          this.logger.log(`当前不在列表页 (${location.pathname})，正在返回列表页...`, 'info');
+          await this.navigateBackToList();
+          await this.wait(3000);
+          continue;
+        }
+
+        this.listPageUrl = location.href;
+        this.saveState();
+        
         let cards = getJobCards();
         
         if (cards.length === 0) {
           this.logger.log('等待职位列表加载...', 'info');
-          await this.wait(1000);
+          await this.wait(1500);
           continue;
         }
 
@@ -929,31 +1080,37 @@
 
           if (!info.company) continue;
           
-          if (info.jobId && processedJobs.has(info.jobId)) {
+          if (info.jobId && this.processedJobs.has(info.jobId)) {
             continue;
           }
 
           if (config.skipBlacklist && isBlacklisted(info.company)) {
-            this.logger.log(`跳过黑名单公司: ${info.company}`, 'warning');
-            if (info.jobId) processedJobs.add(info.jobId);
+            this.logger.log(`跳过已投递公司: ${info.company}`, 'warning');
+            if (info.jobId) this.processedJobs.add(info.jobId);
             continue;
           }
 
           if (config.skipHeadHunter && isHeadHunter(info.company)) {
             this.logger.log(`跳过猎头公司: ${info.company}`, 'warning');
-            if (info.jobId) processedJobs.add(info.jobId);
+            if (info.jobId) this.processedJobs.add(info.jobId);
             continue;
           }
 
           if (config.skipUrgent && isUrgentJob(info.title)) {
             this.logger.log(`跳过急聘岗位: ${info.title}`, 'warning');
-            if (info.jobId) processedJobs.add(info.jobId);
+            if (info.jobId) this.processedJobs.add(info.jobId);
+            continue;
+          }
+
+          if (config.skipAgentRecruit && isAgentRecruit(info)) {
+            this.logger.log(`跳过代招岗位: ${info.title}`, 'warning');
+            if (info.jobId) this.processedJobs.add(info.jobId);
             continue;
           }
 
           if (!isSalaryMatch(info.salary, config.salaryRange)) {
             this.logger.log(`薪资不匹配跳过: ${info.title} - ${info.salary}`, 'warning');
-            if (info.jobId) processedJobs.add(info.jobId);
+            if (info.jobId) this.processedJobs.add(info.jobId);
             continue;
           }
 
@@ -963,16 +1120,26 @@
           }
 
           foundJob = true;
-          if (info.jobId) processedJobs.add(info.jobId);
+          if (info.jobId) this.processedJobs.add(info.jobId);
+          this.saveState();
 
           try {
             await this.handleJob(info, config);
           } catch (e) {
             this.logger.log(`处理失败: ${info.title} - ${e.message}`, 'error');
           }
+          
+          this.saveState();
 
           const interval = this.getRandomInterval(config.applyInterval);
+          this.logger.log(`等待 ${interval} 秒后继续投递...`, 'info');
           await this.wait(interval * 1000);
+          
+          if (!isJobListPage()) {
+            this.logger.log('投递后离开列表页，正在返回...', 'info');
+            await this.navigateBackToList();
+            await this.wait(3000);
+          }
           
           cards = getJobCards();
           break;
@@ -987,13 +1154,21 @@
             this.logger.log('正在翻页...', 'info');
             nextBtn.click();
             await this.wait(3000);
-            processedJobs.clear();
+            this.processedJobs.clear();
+            this.saveState();
           } else {
             this.logger.log('没有更多页面', 'info');
             return;
           }
         }
       }
+    }
+
+    async navigateBackToList() {
+      const targetUrl = this.listPageUrl || DEFAULT_LIST_PAGE;
+      this.logger.log(`跳转到列表页: ${targetUrl}`, 'info');
+      location.href = targetUrl;
+      await this.wait(3000);
     }
 
     getRandomInterval(range) {
@@ -1023,6 +1198,7 @@
         setTimeout(() => {
           this.totalApplied++;
           recordApply();
+          this.saveState();
           this.logger.log(`收藏成功: ${info.title}`, 'success');
           if (getConfig().autoRecordCommunicated) {
             addToBlacklist(info.company, 'auto');
@@ -1043,34 +1219,93 @@
 
         this.logger.log(`正在投递: ${info.title} - ${info.company}`, 'info');
         
+        const originalTarget = applyBtn.target;
+        const originalOnClick = applyBtn.onclick;
+        const originalHref = applyBtn.href;
+        
+        if (applyBtn.tagName === 'A') {
+          applyBtn.target = '_self';
+        }
+        
+        const newWindowOpen = window.open;
+        let openedWindow = null;
+        window.open = function(url, name, specs) {
+          openedWindow = newWindowOpen.call(window, url, name, specs);
+          return openedWindow;
+        };
+        
         applyBtn.click();
         
         setTimeout(() => {
-          const confirmBtn = findBtnByText(document, 'button', '确认投递') ||
-                            findBtnByText(document, 'button', '立即投递') ||
-                            document.querySelector('.confirm-btn');
+          window.open = newWindowOpen;
           
-          if (confirmBtn) {
-            confirmBtn.click();
-            setTimeout(() => {
+          if (applyBtn.tagName === 'A' && originalTarget) {
+            applyBtn.target = originalTarget;
+          }
+          
+          const tryConfirm = () => {
+            const confirmBtn = findBtnByText(document, 'button', '确认投递') ||
+                              findBtnByText(document, 'button', '立即投递') ||
+                              findBtnByText(document, 'button', '确认申请') ||
+                              document.querySelector('.confirm-btn') ||
+                              document.querySelector('[class*="confirm"]');
+            
+            if (confirmBtn) {
+              this.logger.log('点击确认投递按钮', 'info');
+              confirmBtn.click();
+              
+              setTimeout(() => {
+                this.totalApplied++;
+                recordApply();
+                this.saveState();
+                this.logger.log(`投递成功: ${info.title}`, 'success');
+                if (getConfig().autoRecordCommunicated) {
+                  addToBlacklist(info.company, 'auto');
+                }
+                
+                if (openedWindow && !openedWindow.closed) {
+                  this.logger.log('关闭投递弹窗', 'info');
+                  openedWindow.close();
+                }
+                
+                resolve(true);
+              }, 1500);
+            } else if (isJobDetailPage() || !isJobListPage()) {
+              this.logger.log('进入投递详情页，尝试查找投递按钮...', 'info');
+              
+              const detailApplyBtn = findBtnByText(document, 'button', '立即投递') ||
+                                    findBtnByText(document, 'button', '申请职位') ||
+                                    findBtnByText(document, 'a', '立即投递') ||
+                                    document.querySelector('.apply-btn') ||
+                                    document.querySelector('[class*="apply"]');
+              
+              if (detailApplyBtn) {
+                detailApplyBtn.click();
+                setTimeout(tryConfirm.bind(this), 1000);
+              } else {
+                this.totalApplied++;
+                recordApply();
+                this.saveState();
+                this.logger.log(`投递成功: ${info.title}`, 'success');
+                if (getConfig().autoRecordCommunicated) {
+                  addToBlacklist(info.company, 'auto');
+                }
+                resolve(true);
+              }
+            } else {
               this.totalApplied++;
               recordApply();
+              this.saveState();
               this.logger.log(`投递成功: ${info.title}`, 'success');
               if (getConfig().autoRecordCommunicated) {
                 addToBlacklist(info.company, 'auto');
               }
               resolve(true);
-            }, 1000);
-          } else {
-            this.totalApplied++;
-            recordApply();
-            this.logger.log(`投递成功: ${info.title}`, 'success');
-            if (getConfig().autoRecordCommunicated) {
-              addToBlacklist(info.company, 'auto');
             }
-            resolve(true);
-          }
-        }, 500);
+          };
+          
+          tryConfirm.call(this);
+        }, 800);
       });
     }
 
@@ -1697,6 +1932,7 @@
         ]},
         { id: 'skipHeadHunter', group: 'filter', type: 'toggle', label: '屏蔽猎头岗位', desc: '自动跳过猎头公司发布的岗位' },
         { id: 'skipUrgent', group: 'filter', type: 'toggle', label: '屏蔽急聘岗位', desc: '隐藏带有急聘标识的岗位' },
+        { id: 'skipAgentRecruit', group: 'filter', type: 'toggle', label: '屏蔽代招岗位', desc: '跳过带有代招标签的岗位' },
         { id: 'salaryRange', group: 'filter', type: 'range', label: '薪资范围', desc: '过滤薪资不符合要求的岗位' },
         { id: 'skipBlacklist', group: 'company', type: 'toggle', label: '跳过黑名单公司', desc: '自动跳过已沟通或手动添加的公司' },
         { id: 'autoRecordCommunicated', group: 'company', type: 'toggle', label: '关闭沟通后自动记录', desc: '关闭沟通会话后自动将公司加入跳过列表' },
@@ -1848,14 +2084,36 @@
         }
         
         saveConfig(newConfig);
+        
+        const verifyConfig = getConfig();
+        let isSaved = true;
+        for (const key of Object.keys(newConfig)) {
+          if (typeof newConfig[key] === 'object') {
+            if (JSON.stringify(newConfig[key]) !== JSON.stringify(verifyConfig[key])) {
+              isSaved = false;
+              break;
+            }
+          } else {
+            if (newConfig[key] !== verifyConfig[key]) {
+              isSaved = false;
+              break;
+            }
+          }
+        }
+        
         const saveText = saveBtn.querySelector('.zp-save-text');
         const saveSuccess = saveBtn.querySelector('.zp-save-success');
-        saveText.style.display = 'none';
-        saveSuccess.style.display = 'inline';
-        setTimeout(() => {
-          saveText.style.display = 'inline';
-          saveSuccess.style.display = 'none';
-        }, 2000);
+        if (isSaved) {
+          saveText.style.display = 'none';
+          saveSuccess.style.display = 'inline';
+          toast.success('设置已保存并生效');
+          setTimeout(() => {
+            saveText.style.display = 'inline';
+            saveSuccess.style.display = 'none';
+          }, 2000);
+        } else {
+          toast.error('设置保存失败，请重试');
+        }
       };
       
       modal.show();
@@ -2283,6 +2541,16 @@
            location.pathname.includes('/jobs/');
   };
   
+  const isJobListPage = () => {
+    return location.pathname.includes('/recommend') ||
+           location.pathname.includes('/search/') ||
+           location.pathname.includes('/jobslist/') ||
+           document.querySelectorAll('.joblist-box__item').length > 0 ||
+           document.querySelectorAll('.joblist-item').length > 0;
+  };
+  
+  const DEFAULT_LIST_PAGE = 'https://www.zhaopin.com/recommend';
+  
   const statsStyles = `
 .zp-stats-content {
   padding: 24px;
@@ -2496,6 +2764,28 @@
       this.container.appendChild(this.statsBtn);
       this.container.appendChild(this.settingsBtn);
       document.body.appendChild(this.container);
+      
+      this.checkAndResume();
+    }
+    
+    checkAndResume() {
+      const state = storage.get('zp_autoapply_state');
+      if (state && state.isRunning) {
+        const elapsed = Date.now() - state.timestamp;
+        if (elapsed < 30 * 60 * 1000) {
+          this.isAutoRunning = true;
+          this.autoApplyBtn.classList.add('zp-active');
+          this.autoApplyBtn.dataset.tooltip = '停止投递';
+          
+          setTimeout(() => {
+            this.autoApply.start({ resume: true }).finally(() => {
+              this.isAutoRunning = false;
+              this.autoApplyBtn.classList.remove('zp-active');
+              this.autoApplyBtn.dataset.tooltip = '自动投递';
+            });
+          }, 2000);
+        }
+      }
     }
     
     toggleAutoApply() {
@@ -2508,7 +2798,11 @@
         this.isAutoRunning = true;
         this.autoApplyBtn.classList.add('zp-active');
         this.autoApplyBtn.dataset.tooltip = '停止投递';
-        this.autoApply.start();
+        this.autoApply.start({ resume: false }).finally(() => {
+          this.isAutoRunning = false;
+          this.autoApplyBtn.classList.remove('zp-active');
+          this.autoApplyBtn.dataset.tooltip = '自动投递';
+        });
       }
     }
   }
